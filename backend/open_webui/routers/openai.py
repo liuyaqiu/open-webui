@@ -540,6 +540,28 @@ async def verify_connection(
             raise HTTPException(status_code=500, detail=error_detail)
 
 
+def get_model_with_version(model_and_version: str):
+    if "/" not in model_and_version:
+        return model_and_version, None
+    else:
+        return model_and_version.split("/")
+
+def is_azure_model(url: str):
+    return "ai.azure.com" in url
+
+def get_azure_completion_url(url: str, model_and_version: str):
+    _, api_version = get_model_with_version(model_and_version)
+    assert api_version is not None, f"API version is not provided for Azure model: {model_and_version}"
+    return f"{url}/chat/completions?api-version={api_version}"
+
+def is_azure_openai_model(url: str):
+    return "openai.azure.com" in url
+
+def get_azure_openai_completion_url(url: str, model_and_version: str):
+    model_name, api_version = get_model_with_version(model_and_version)
+    assert api_version is not None, f"API version is not provided for Azure OpenAI model: {model_and_version}"
+    return f"{url}/deployments/{model_name}/chat/completions?api-version={api_version}"
+
 @router.post("/chat/completions")
 async def generate_chat_completion(
     request: Request,
@@ -609,6 +631,7 @@ async def generate_chat_completion(
     if prefix_id:
         payload["model"] = payload["model"].replace(f"{prefix_id}.", "")
 
+    payload["model"], _ = get_model_with_version(payload["model"])
     # Add user info to the payload if the model is a pipeline
     if "pipeline" in model and model.get("pipeline"):
         payload["user"] = {
@@ -647,32 +670,44 @@ async def generate_chat_completion(
             trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
         )
 
+        if is_azure_openai_model(url):
+            url = get_azure_openai_completion_url(url, model_id)
+        elif is_azure_model(url):
+            url = get_azure_completion_url(url, model_id)
+        else:
+            url = f"{url}/chat/completions"
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            **(
+                {
+                    "HTTP-Referer": "https://openwebui.com/",
+                    "X-Title": "Open WebUI",
+                }
+                if "openrouter.ai" in url
+                else {}
+            ),
+            **(
+                {
+                    "X-OpenWebUI-User-Name": user.name,
+                    "X-OpenWebUI-User-Id": user.id,
+                    "X-OpenWebUI-User-Email": user.email,
+                    "X-OpenWebUI-User-Role": user.role,
+                }
+                if ENABLE_FORWARD_USER_INFO_HEADERS
+                else {}
+            ),
+        }
+        if is_azure_model(url) or is_azure_openai_model(url):
+            headers["api-key"] = key
+            headers.pop("Authorization")
+
+        log.info(f"Request to {url} with payload: {payload}")
         r = await session.request(
             method="POST",
-            url=f"{url}/chat/completions",
+            url=url,
             data=payload,
-            headers={
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json",
-                **(
-                    {
-                        "HTTP-Referer": "https://openwebui.com/",
-                        "X-Title": "Open WebUI",
-                    }
-                    if "openrouter.ai" in url
-                    else {}
-                ),
-                **(
-                    {
-                        "X-OpenWebUI-User-Name": user.name,
-                        "X-OpenWebUI-User-Id": user.id,
-                        "X-OpenWebUI-User-Email": user.email,
-                        "X-OpenWebUI-User-Role": user.role,
-                    }
-                    if ENABLE_FORWARD_USER_INFO_HEADERS
-                    else {}
-                ),
-            },
+            headers=headers,
         )
 
         # Check if response is SSE
