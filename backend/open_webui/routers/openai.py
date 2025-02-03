@@ -690,6 +690,22 @@ def convert_to_azure_payload(
     return url, payload
 
 
+def get_model_with_version(model_and_version: str):
+    if "/" not in model_and_version:
+        return model_and_version, None
+    else:
+        return model_and_version.split("/")
+
+
+def is_azure_openai_model(url: str):
+    return "/openai" in url
+
+
+def get_azure_openai_completion_url(url: str, model_and_version: str):
+    model_name, api_version = get_model_with_version(model_and_version)
+    return f"{url}/deployments/{model_name}/chat/completions?api-version={api_version}", model_name
+
+
 @router.post("/chat/completions")
 async def generate_chat_completion(
     request: Request,
@@ -759,6 +775,7 @@ async def generate_chat_completion(
     if prefix_id:
         payload["model"] = payload["model"].replace(f"{prefix_id}.", "")
 
+    payload["model"], _ = get_model_with_version(payload["model"])
     # Add user info to the payload if the model is a pipeline
     if "pipeline" in model and model.get("pipeline"):
         payload["user"] = {
@@ -784,6 +801,11 @@ async def generate_chat_completion(
     if "max_tokens" in payload and "max_completion_tokens" in payload:
         del payload["max_tokens"]
 
+    if is_azure_openai_model(url):
+        url, payload['model'] = get_azure_openai_completion_url(url, model_id)
+    else:
+        url = f"{url}/chat/completions"
+
     # Convert the modified body back to JSON
     if "logit_bias" in payload:
         payload["logit_bias"] = json.loads(
@@ -791,6 +813,7 @@ async def generate_chat_completion(
         )
 
     headers = {
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
         **(
             {
@@ -812,16 +835,6 @@ async def generate_chat_completion(
         ),
     }
 
-    if api_config.get("azure", False):
-        request_url, payload = convert_to_azure_payload(url, payload)
-        api_version = api_config.get("api_version", "") or "2023-03-15-preview"
-        headers["api-key"] = key
-        headers["api-version"] = api_version
-        request_url = f"{request_url}/chat/completions?api-version={api_version}"
-    else:
-        request_url = f"{url}/chat/completions"
-        headers["Authorization"] = f"Bearer {key}"
-
     payload = json.dumps(payload)
 
     r = None
@@ -833,10 +846,10 @@ async def generate_chat_completion(
         session = aiohttp.ClientSession(
             trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
         )
-
+        log.info(f"Request to {url} with payload: {payload}")
         r = await session.request(
             method="POST",
-            url=request_url,
+            url=url,
             data=payload,
             headers=headers,
             ssl=AIOHTTP_CLIENT_SESSION_SSL,
